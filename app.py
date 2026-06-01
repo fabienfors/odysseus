@@ -527,8 +527,12 @@ from routes.calendar_routes import setup_calendar_routes
 app.include_router(setup_calendar_routes())
 
 # Shell (user-facing command execution)
-from routes.shell_routes import setup_shell_routes
-app.include_router(setup_shell_routes())
+try:
+    from routes.shell_routes import setup_shell_routes
+    app.include_router(setup_shell_routes())
+except Exception as e:
+    import logging as _logging
+    _logging.getLogger(__name__).warning("Shell routes not loaded: %s", e)
 
 # Cookbook (model download/serve/cache, cookbook state sync)
 from routes.cookbook_routes import setup_cookbook_routes
@@ -600,7 +604,7 @@ app.include_router(setup_contacts_routes())
 
 def _serve_html_with_nonce(request: Request, file_path: str) -> HTMLResponse:
     """Read an HTML file and inject the CSP nonce into inline <script> tags."""
-    with open(file_path, "r") as f:
+    with open(file_path, "r", encoding="utf-8") as f:
         html = f.read()
     nonce = getattr(request.state, "csp_nonce", "")
     html = html.replace("{{CSP_NONCE}}", nonce)

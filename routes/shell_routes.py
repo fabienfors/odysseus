@@ -4,14 +4,20 @@ import asyncio
 import json
 import logging
 import os
-import pty
-import fcntl
+
+import sys
 import shlex
 import shutil
 import uuid
 import tempfile
 from pathlib import Path
 from typing import Dict, Any
+
+_IS_WINDOWS = sys.platform == "win32"
+
+if not _IS_WINDOWS:
+    import pty
+    import fcntl
 
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
@@ -95,8 +101,67 @@ async def _exec_shell(command: str, timeout: int = EXEC_TIMEOUT) -> Dict[str, An
         return {"stdout": "", "stderr": str(e), "exit_code": -1}
 
 
+async def _generate_pty_windows(cmd: str, timeout: int, request: Request):
+    """Windows PTY implementation using pywinpty."""
+    try:
+        import winpty
+    except ImportError:
+        yield f"data: {json.dumps({'stream': 'stderr', 'data': 'PTY mode requires pywinpty on Windows. Install with: pip install pywinpty'})}\n\n"
+        yield f"data: {json.dumps({'exit_code': -1})}\n\n"
+        return
+
+    loop = asyncio.get_event_loop()
+    deadline = (loop.time() + timeout) if timeout else None
+
+    try:
+        pty_proc = winpty.PtyProcess.spawn(cmd)
+    except Exception as e:
+        yield f"data: {json.dumps({'stream': 'stderr', 'data': str(e)})}\n\n"
+        yield f"data: {json.dumps({'exit_code': -1})}\n\n"
+        return
+
+    try:
+        while pty_proc.isalive():
+            if deadline and loop.time() > deadline:
+                pty_proc.terminate(force=True)
+                yield f"data: {json.dumps({'stream': 'stderr', 'data': f'Command timed out after {timeout}s'})}\n\n"
+                yield f"data: {json.dumps({'exit_code': -1})}\n\n"
+                return
+
+            if await request.is_disconnected():
+                pty_proc.terminate(force=True)
+                return
+
+            try:
+                chunk = await asyncio.wait_for(
+                    loop.run_in_executor(None, pty_proc.read, 4096),
+                    timeout=2.0,
+                )
+                if chunk:
+                    for line in chunk.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                        if line:
+                            yield f"data: {json.dumps({'stream': 'stdout', 'data': line})}\n\n"
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                break
+
+        exit_code = pty_proc.exitstatus if pty_proc.exitstatus is not None else 0
+        yield f"data: {json.dumps({'exit_code': exit_code})}\n\n"
+    finally:
+        try:
+            pty_proc.terminate(force=True)
+        except Exception:
+            pass
+
+
 async def _generate_pty(cmd: str, timeout: int, request: Request):
     """Run command in a pseudo-TTY so tqdm/progress bars work natively."""
+    if _IS_WINDOWS:
+        async for chunk in _generate_pty_windows(cmd, timeout, request):
+            yield chunk
+        return
+
     loop = asyncio.get_event_loop()
     master_fd, slave_fd = pty.openpty()
 
@@ -213,24 +278,29 @@ async def _generate_pty(cmd: str, timeout: int, request: Request):
             pass
 
 
-def _pty_read(fd: int) -> bytes | None:
-    """Blocking read from PTY fd. Called via run_in_executor.
-    Returns bytes on data, None on timeout (no data yet)."""
-    import select
-    r, _, _ = select.select([fd], [], [], 1.0)
-    if r:
-        try:
-            data = os.read(fd, 4096)
-            return data if data else b""  # empty = EOF
-        except OSError:
-            return b""  # fd closed = EOF
-    return None  # timeout, no data yet
+if not _IS_WINDOWS:
+    def _pty_read(fd: int) -> bytes | None:
+        """Blocking read from PTY fd. Called via run_in_executor.
+        Returns bytes on data, None on timeout (no data yet)."""
+        import select
+        r, _, _ = select.select([fd], [], [], 1.0)
+        if r:
+            try:
+                data = os.read(fd, 4096)
+                return data if data else b""  # empty = EOF
+            except OSError:
+                return b""  # fd closed = EOF
+        return None  # timeout, no data yet
 
 
 async def _generate_tmux(cmd: str, request: Request):
     """Run command in a tmux session. Streams output via a log file.
     The tmux session survives browser disconnect — user can reconnect or
     `tmux attach -t <name>` to see it live."""
+    if _IS_WINDOWS:
+        yield f"data: {json.dumps({'stream': 'stderr', 'data': 'tmux mode is not supported on Windows'})}\n\n"
+        yield f"data: {json.dumps({'exit_code': -1})}\n\n"
+        return
     TMUX_LOG_DIR.mkdir(parents=True, exist_ok=True)
     session_id = f"cookbook-{uuid.uuid4().hex[:8]}"
     log_path = TMUX_LOG_DIR / f"{session_id}.log"
